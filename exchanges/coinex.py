@@ -1,78 +1,159 @@
 import asyncio
-import json
+import traceback
 import os
-import ccxt.async_support as ccxt
-from datetime import datetime
+import json
+
 from uuid import uuid4
+from njit_funcs import calc_diff
+from passivbot import Bot, logging
+from procedures import print_async_exception, utc_ms, make_get_filepath
+from pure_funcs import determine_pos_side_ccxt, floatify, calc_hash, ts_to_date_utc
 
-# Asumiendo que funciones como load_ccxt_version y otras ya están definidas correctamente
-ccxt_version_req = "1.42.78"  # Ejemplo, asegúrate de tener la versión correcta instalada
-assert ccxt.__version__ == ccxt_version_req, f"ccxt version mismatch, expected {ccxt_version_req}, got {ccxt.__version__}"
+import ccxt.async_support as ccxt
 
-class CoinExFuturesBot:
+
+from procedures import load_ccxt_version
+
+# Verification of the ccxt version for compatibility
+ccxt_version_req = load_ccxt_version()
+assert (
+    ccxt.__version__ == ccxt_version_req
+), f"Currently ccxt {ccxt.__version__} is installed. Please pip reinstall requirements.txt or install ccxt v{ccxt_version_req} manually"
+
+class CoinExBot(Bot):
     def __init__(self, config: dict):
         self.exchange = "coinex"
-        self.symbol = config["symbol"]  # Ejemplo: "BTC-USDT-PERP"
-        self.cc = getattr(ccxt, "coinex")({
-            "apiKey": config["apiKey"],
-            "secret": config["secret"],
-            # Especifica más parámetros si son necesarios, por ejemplo, 'enableRateLimit': True
+        self.market_type = config.get("market_type", "linear_perpetual")
+        self.inverse = config.get("inverse", False)
+        self.max_n_orders_per_batch = 7
+        self.max_n_cancellations_per_batch = 10
+
+        super().__init__(config)
+      # Configure the connection to the CoinEx API.
+        self.cc = ccxt.coinex({
+            "apiKey": self.key,
+            "secret": self.secret,
         })
-        self.config = config
 
-    async def fetch_positions(self):
-        # Este método asume que la exchange proporciona un endpoint directo para consultar posiciones abiertas
-        positions = await self.cc.fetch_positions(symbols=[self.symbol])
-        return positions
+    def init_market_type(self):
+        supported_symbols = [market["symbol"] for market in self.cc.fetch_markets()]
+        if self.symbol not in supported_symbols:
+            raise Exception(f"Unsupported symbol {self.symbol} for CoinEx")
 
-    async def set_leverage(self, leverage: int):
-        # CoinEx podría tener un método específico para establecer el apalancamiento de una posición
-        # El siguiente es un placeholder y debe ser adaptado según la API de CoinEx
-        response = await self.cc.private_post_position_leverage({
-            'symbol': self.symbol,
-            'leverage': leverage,
-            # Añade más parámetros si son necesarios
-        })
-        print("Apalancamiento establecido:", response)
+async def fetch_market_info_from_cache(self):
+    fname = make_get_filepath("caches/coinex_market_info.json")
+    info = None
+    try:
+        if os.path.exists(fname):
+            info = json.load(open(fname))
+            logging.info("loaded CoinEx market info from cache")
+        # Check if the information is outdated (more than 24 hours).
+        if info is None or utc_ms() - info["dump_ts"] > 1000 * 60 * 60 * 24:
+           # Update the information from the exchange.
+            info = {"info": await self.cc.fetch_markets(), "dump_ts": utc_ms()}
+            json.dump(info, open(fname, "w"), indent=4)
+            logging.info("dumped CoinEx market info to cache")
+    except Exception as e:
+        logging.error(f"failed to load CoinEx market info from cache {e}")
+        traceback.print_exc()
+        if info is None:
+            info = {"info": await self.cc.fetch_markets(), "dump_ts": utc_ms()}
+            json.dump(info, open(fname, "w"), indent=4)
+            logging.info("dumped CoinEx market info to cache")
+    return info["info"]
+async def _init(self):
+    info = await self.fetch_market_info_from_cache()
+    found = False
+    for elm in info:
+        if elm["symbol"] == self.symbol:  
+            found = True
+            self.max_leverage = elm.get("limits", {}).get("leverage", {}).get("max", None)
+            self.coin = elm.get("base", None)  
+            self.quote = elm.get("quote", None) 
+            self.price_step = self.config["price_step"] = elm.get("precision", {}).get("price", None)
+            self.qty_step = self.config["qty_step"] = elm.get("precision", {}).get("amount", None)
+            self.min_qty = self.config["min_qty"] = elm.get("limits", {}).get("amount", {}).get("min", None)
+            self.min_cost = self.config["min_cost"] = elm.get("limits", {}).get("cost", {}).get("min", 0.1)  # Asumiendo un valor predeterminado
+            self.margin_coin = self.quote
+            break
+    if not found:
+        raise Exception(f"Unsupported symbol {self.symbol} for CoinEx")
 
-    async def create_limit_order(self, side, amount, price):
-        # CoinEx requiere especificación del mercado de futuros para crear una orden
-        order = await self.cc.create_order(symbol=self.symbol, type='limit', side=side, amount=amount, price=price, params={"market": "futures"})
-        return order
+    await super()._init()  
 
-    async def cancel_order(self, order_id):
-        result = await self.cc.cancel_order(order_id, symbol=self.symbol)
-        return result
+async def fetch_ticker(self, symbol=None):
+    ticker = None
+    try:
+        symbol_to_fetch = self.symbol if symbol is None else symbol
+        ticker = await self.cc.fetch_ticker(symbol_to_fetch)
+        return ticker
+    except Exception as e:
+        logging.error(f"error fetching ticker for {symbol_to_fetch}: {e}")
+        return None
 
-    async def fetch_balance(self):
-        balance = await self.cc.fetch_balance(params={"type": "future"})
-        return balance
+async def init_order_book(self):
+    return await self.fetch_ticker()
 
-    async def main(self):
-        print("Iniciando bot para futuros de CoinEx")
-        positions = await self.fetch_positions()
-        print("Posiciones abiertas:", positions)
+async def fetch_open_orders(self) -> [dict]:
+    open_orders = None
+    try:
+        open_orders = await self.cc.fetch_open_orders(symbol=self.symbol, limit=50)
+        
+        return [
+            {
+                "order_id": o["id"],  # Unique identifier of the order
+                "custom_id": o.get("info", {}).get("clientOrderId", ""),  # Custom customer ID, if available
+                "symbol": o["symbol"],  # Symbol of the market
+                "price": o.get("price"),  # Price of the order
+                "qty": o["amount"],  # Quantity of the order
+                "type": o["type"],  # Type of the order, for example, limit or market
+                "side": o["side"],  # Side of the order, buy or sell
+                "timestamp": o["timestamp"],  # Time mark of the order
+            }
+            for o in open_orders
+        ]
+    except Exception as e:
+        logging.error(f"error fetching open orders {e}")
+        traceback.print_exc()
+        return []
 
-        balance = await self.fetch_balance()
-        print("Balance:", balance)
+async def get_server_time(self):
+    server_time = None
+    try:
+        # Try to get the time from the server directly if CCXT supports it for CoinEx
+        server_time = await self.cc.fetch_time()
+        return server_time
+    except Exception as e:
+        logging.error(f"error fetching server time: {e}")
+        traceback.print_exc()
+        return None
 
-        # Ejemplo de cómo establecer el apalancamiento
-        await self.set_leverage(10)
-
-        # Crear una orden limitada como ejemplo
-        order = await self.create_limit_order('buy', 1, 10000)  # Estos valores son solo ejemplos
-        print("Orden creada:", order)
-
-        # Cancelar la orden creada como ejemplo
-        cancel_result = await self.cancel_order(order['id'])
-        print("Orden cancelada:", cancel_result)
-
-if __name__ == "__main__":
-    config = {
-        "apiKey": "TU_API_KEY",
-        "secret": "TU_SECRET_KEY",
-        "symbol": "BTC-USDT-PERP",  # Asegúrate de usar el símbolo correcto para futuros
+async def fetch_position(self) -> dict:
+    position = {
+        "long": {"size": 0.0, "price": 0.0, "liquidation_price": 0.0},
+        "short": {"size": 0.0, "price": 0.0, "liquidation_price": 0.0},
+        "wallet_balance": 0.0,
+        "equity": 0.0,
     }
-    bot = CoinExFuturesBot(config)
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(bot.main())
+    try:
+        # Suponiendo que fetch_balance puede ser utilizado directamente como en el ejemplo.
+        balance = await self.cc.fetch_balance()
+        # La implementación específica para obtener detalles de la posición puede variar.
+        # A continuación se muestra un enfoque genérico; ajusta según la API de CoinEx.
+        positions = await self.cc.fetch_positions()
+        for p in positions:
+            if p["symbol"] == self.symbol:
+                side = "long" if p["size"] > 0 else "short"
+                position[side] = {
+                    "size": abs(p["size"]),
+                    "price": p.get("entry_price", 0.0),
+                    "liquidation_price": p.get("liquidation_price", 0.0),
+                }
+        position["wallet_balance"] = balance.get(self.quote, {}).get("total", 0.0)
+        # Asume que 'equity' necesita ser calculado o extraído específicamente; ajusta según sea necesario.
+        return position
+    except Exception as e:
+        logging.error(f"Error fetching position or balance: {e}")
+        traceback.print_exc()
+        return None
+
