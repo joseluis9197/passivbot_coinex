@@ -1,48 +1,72 @@
 import asyncio
-import hashlib
-import hmac
 import json
-from time import time
-from urllib.parse import urlencode
+import os
+from uuid import uuid4
+from procedures import load_ccxt_version, print_async_exception, make_get_filepath, utc_ms
+import ccxt.async_support as ccxt
 
-import aiohttp
-import numpy as np
+ccxt_version_req = load_ccxt_version()
+assert ccxt.__version__ == ccxt_version_req, f"ccxt version mismatch, expected {ccxt_version_req}, got {ccxt.__version__}"
 
-from passivbot import Bot, logging
-from procedures import print_, print_async_exception
-from pure_funcs import ts_to_date, sort_dict_keys, format_float
-
-class CoinExBot(Bot):
+class CoinExBot:
     def __init__(self, config: dict):
         self.exchange = "coinex"
-        super().__init__(config)
-        self.session = aiohttp.ClientSession()
-        # Define la URL base de la API de CoinEx aquí
-        self.base_endpoint = "https://api.coinex.com/v1"
-        self.headers = {"Authorization": self._generate_auth_header()}
+        self.market_type = config.get("market_type", "spot")
+        self.cc = getattr(ccxt, "coinex")({
+            "apiKey": config["apiKey"],
+            "secret": config["secret"],
+        })
+        self.symbol = config["symbol"]
+        self.config = config
 
-    def _generate_auth_header(self):
-        # Aquí debes implementar la generación del header de autenticación específico para CoinEx
-        # La autenticación de CoinEx generalmente requiere una firma HMAC y un timestamp
-        # Consulta la documentación de la API de CoinEx para más detalles
-        pass
+    async def fetch_market_info(self):
+        fname = make_get_filepath("caches/coinex_market_info.json")
+        if os.path.exists(fname):
+            with open(fname) as f:
+                info = json.load(f)
+            if utc_ms() - info["dump_ts"] < 1000 * 60 * 60 * 24:
+                return info["info"]
+        markets = await self.cc.load_markets()
+        info = {"info": markets, "dump_ts": utc_ms()}
+        with open(fname, "w") as f:
+            json.dump(info, f)
+        return markets
 
-    async def public_get(self, url: str, params: dict = {}) -> dict:
-        # Implementa llamadas GET públicas a la API de CoinEx
-        pass
+    async def fetch_open_orders(self):
+        return await self.cc.fetch_open_orders(symbol=self.symbol)
 
-    async def private_post(self, url: str, params: dict = {}) -> dict:
-        # Implementa llamadas POST privadas a la API de CoinEx
-        pass
+    async def create_order(self, order_type, side, amount, price=None):
+        if order_type == "limit":
+            return await self.cc.create_limit_order(self.symbol, side, amount, price)
+        elif order_type == "market":
+            return await self.cc.create_market_order(self.symbol, side, amount)
 
-    # Implementa otros métodos específicos necesarios para la lógica de trading con CoinEx
+    async def cancel_order(self, order_id):
+        return await self.cc.cancel_order(order_id, symbol=self.symbol)
 
-    async def _init(self):
-        # Inicialización específica para CoinEx (p.ej., obtener información del mercado)
-        pass
+    async def fetch_balance(self):
+        return await self.cc.fetch_balance()
 
-    # implementar todos los métodos abstractos de la clase Bot
+    async def fetch_ticker(self):
+        return await self.cc.fetch_ticker(symbol=self.symbol)
 
-# implementar métodos para gestionar órdenes, obtener balances, manejar errores, etc.,
-# de acuerdo a las peculiaridades de la API de CoinEx.
+    async def main(self):
+        await self.cc.load_markets()
+        market_info = await self.fetch_market_info()
+        print(market_info[self.symbol])
+        open_orders = await self.fetch_open_orders()
+        print(open_orders)
+        balance = await self.fetch_balance()
+        print(balance)
+        ticker = await self.fetch_ticker()
+        print(ticker)
 
+if __name__ == "__main__":
+    config = {
+        "apiKey": "your_api_key",
+        "secret": "your_api_secret",
+        "symbol": "BTC/USDT"
+    }
+    bot = CoinExBot(config)
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(bot.main())
